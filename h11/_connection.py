@@ -68,6 +68,20 @@ class PAUSED(Sentinel, metaclass=Sentinel):
 # - Apache: <8 KiB per line>
 DEFAULT_MAX_INCOMPLETE_EVENT_SIZE = 16 * 1024
 
+# A cap on the total number of bytes we're willing to hold in our receive
+# buffer at any one time. Unlike max_incomplete_event_size, this applies to
+# *everything* that has been handed to us but not yet consumed by the caller
+# via next_event(): the incomplete event being parsed, and also any complete
+# events (e.g. pipelined requests, or message bodies) that are still queued
+# up in the buffer.
+#
+# max_incomplete_event_size alone can't bound memory usage: an attacker can
+# send data in tiny fragments that always parse into complete events, so the
+# buffer grows without ever holding an oversized *incomplete* event. This
+# limit closes that gap, while staying generous enough that legitimate
+# pipelining and a temporarily slow reader don't get interrupted.
+DEFAULT_MAX_EVENT_BUFFER_SIZE = 16 * 1024 * 1024
+
 
 # RFC 7230's rules for connection lifecycles:
 # - If either side says they want to close the connection, then the connection
@@ -162,14 +176,33 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        max_event_buffer_size (int):
+            The maximum number of received bytes we're willing to buffer on
+            this connection at any one time. This covers the full receive
+            buffer: both the not-yet-complete event counted by
+            *max_incomplete_event_size*, and any complete events that have
+            been parsed but not yet taken away by :meth:`next_event` (for
+            example pipelined requests, or data waiting while the
+            connection is :data:`PAUSED`). If adding data would take the
+            buffer past this size, then :meth:`receive_data` will raise
+            :exc:`RemoteProtocolError`.
+
+            The point of this second limit is that
+            *max_incomplete_event_size* alone does not bound memory usage: a
+            peer can keep the buffer growing indefinitely by sending many
+            small, individually-complete events faster than they are
+            consumed, without ever producing an oversized incomplete event.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        max_event_buffer_size: int = DEFAULT_MAX_EVENT_BUFFER_SIZE,
     ) -> None:
         self._max_incomplete_event_size = max_incomplete_event_size
+        self._max_event_buffer_size = max_event_buffer_size
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
             raise ValueError(f"expected CLIENT or SERVER, not {our_role!r}")
@@ -399,10 +432,30 @@ class Connection:
                 (Calling ``receive_data(b"")`` multiple times is fine,
                 and equivalent to calling it once.)
 
+            RemoteProtocolError:
+                Raised if accepting *data* would make the total amount of
+                received-but-not-yet-consumed data exceed
+                *max_event_buffer_size*. This applies regardless of whether
+                the buffered data makes up complete events or an incomplete
+                one, so a peer cannot evade the limit by splitting its
+                traffic into many small complete events.
+
         """
         if data:
             if self._receive_buffer_closed:
                 raise RuntimeError("received close, then received more data?")
+            if len(self._receive_buffer) + len(data) > self._max_event_buffer_size:
+                # The buffer holds two kinds of received-but-unconsumed
+                # bytes: the incomplete event currently being parsed, and
+                # any complete events queued behind it (pipelining, or a
+                # paused connection). The incomplete-event limit only
+                # covers the former, so enforce a cap on the total here --
+                # otherwise a peer can grow the buffer without bound by
+                # streaming many small, individually-complete events.
+                self._process_error(self.their_role)
+                raise RemoteProtocolError(
+                    "Receive buffer too long", error_status_hint=431
+                )
             self._receive_buffer += data
         else:
             self._receive_buffer_closed = True

@@ -838,6 +838,39 @@ And your code that uses this will have to remember to check for
 :attr:`~Connection.they_are_waiting_for_100_continue` at the
 appropriate time.
 
+Buffer limits
+~~~~~~~~~~~~~
+
+The back-pressure above is what keeps memory usage bounded in a
+well-behaved program, but h11 also enforces two hard limits so that a
+misbehaving peer cannot make a :class:`Connection` allocate memory
+without bound:
+
+* ``max_incomplete_event_size`` caps the size of a single event that
+  has been partially received but not yet fully parsed -- in practice
+  this mostly limits the size of a request/response line plus its
+  headers. Exceeding it makes :meth:`~Connection.next_event` raise
+  :exc:`~h11.RemoteProtocolError`.
+
+* ``max_event_buffer_size`` caps the *total* number of bytes held in
+  the receive buffer at any one time. This counts everything that has
+  been passed to :meth:`~Connection.receive_data` but not yet consumed
+  via :meth:`~Connection.next_event`: the incomplete event above, and
+  also any complete events that are queued up waiting to be read (for
+  example pipelined requests, or data buffered while the connection is
+  :data:`PAUSED`). Exceeding it makes
+  :meth:`~Connection.receive_data` raise
+  :exc:`~h11.RemoteProtocolError`.
+
+The second limit is needed because the first one alone does not bound
+memory usage: a peer can keep the buffer growing forever by sending
+many small, individually-complete events faster than they are
+consumed, without ever producing an oversized *incomplete* event. The
+default total limit is deliberately generous, so legitimate
+pipelining and a temporarily slow reader are unaffected -- only a peer
+that genuinely keeps more than the limit of unconsumed data in flight
+is disconnected.
+
 
 .. _closing:
 

@@ -486,6 +486,86 @@ def test_max_incomplete_event_size_countermeasure() -> None:
         c.next_event()
 
 
+def test_max_event_buffer_size_countermeasure() -> None:
+    # max_incomplete_event_size only caps a single *incomplete* event, so a
+    # peer can grow the buffer without bound by streaming many small,
+    # individually-complete events. max_event_buffer_size caps the total
+    # amount of received-but-unconsumed data instead.
+    request = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+
+    # The default limit is generous and leaves ordinary pipelining alone.
+    c = Connection(SERVER)
+    c.receive_data(request * 4)
+    assert get_all_events(c) == [
+        Request(method="GET", target="/", headers=[("host", "a")]),
+        EndOfMessage(),
+    ]
+
+    # A small total limit triggers once the queued complete events pile up,
+    # even though no individual event is ever incomplete or oversized.
+    c = Connection(SERVER, max_event_buffer_size=100)
+    c.receive_data(request)
+    assert get_all_events(c) == [
+        Request(method="GET", target="/", headers=[("host", "a")]),
+        EndOfMessage(),
+    ]
+    # The first request is still queued in the buffer (the connection is
+    # paused until the server responds), so a second pipelined request
+    # pushes the buffered total over the limit.
+    with pytest.raises(RemoteProtocolError) as excinfo:
+        c.receive_data(request * 4)
+    assert excinfo.value.error_status_hint == 431
+    assert c.their_state is ERROR
+
+    # The same attack without pipelining: a message body fed in single-byte
+    # fragments. Each fragment is immediately part of a parseable Data event,
+    # so there is never an oversized incomplete event to trip the other
+    # limit -- but an unread body still accumulates in the buffer.
+    c = Connection(SERVER, max_event_buffer_size=200)
+    c.receive_data(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n"
+    )
+    assert get_all_events(c) == [
+        Request(
+            method="POST",
+            target="/",
+            headers=[("host", "a"), ("content-length", "1000")],
+        ),
+    ]
+    with pytest.raises(RemoteProtocolError):
+        for _ in range(1000):
+            c.receive_data(b"a")
+    assert c.their_state is ERROR
+
+    # Data that fits within the total limit is still accepted, including a
+    # single message body larger than the (smaller) incomplete-event limit.
+    c = Connection(SERVER, max_event_buffer_size=1000)
+    c.receive_data(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 500\r\n\r\n" + b"a" * 500
+    )
+    events = get_all_events(c)
+    assert events == [
+        Request(
+            method="POST",
+            target="/",
+            headers=[("host", "a"), ("content-length", "500")],
+        ),
+        Data(data=b"a" * 500),
+        EndOfMessage(),
+    ]
+
+    # Consuming events frees up the budget: draining the buffer between
+    # receives means a peer can send an unlimited amount of data in total,
+    # as long as it never exceeds the cap at any single moment.
+    c = Connection(SERVER, max_event_buffer_size=100)
+    for _ in range(20):
+        c.receive_data(request)
+        get_all_events(c)
+        c.send(Response(status_code=200, headers=[]))
+        c.send(EndOfMessage())
+        c.start_next_cycle()
+
+
 def test_reuse_simple() -> None:
     p = ConnectionPair()
     p.send(
