@@ -716,6 +716,44 @@ def test_protocol_switch() -> None:
             p.conn[SERVER].send(Data(data=b"123"))
 
 
+def test_protocol_switch_before_request_body_finished() -> None:
+    # The server accepts an Upgrade proposal while the client's request
+    # body is still in flight. The not-yet-consumed tail of the request
+    # belongs to the old protocol, so trailing_data must not hand it out
+    # as new-protocol data; it's finished off as regular events, and only
+    # the bytes after it belong to the new protocol.
+    server = Connection(SERVER)
+    server.receive_data(
+        b"POST / HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"Upgrade: a\r\n"
+        b"Content-Length: 5\r\n"
+        b"\r\n"
+        b"hel"
+    )
+    event = server.next_event()
+    assert type(event) is Request
+    # Accept the upgrade early, before the request body has fully arrived
+    server.send(InformationalResponse(status_code=101, headers=[("Upgrade", "a")]))
+    assert server.our_state is SWITCHED_PROTOCOL
+    assert server.their_state is SEND_BODY
+    # The buffered b"hel" is the tail of the old request, not the first
+    # new-protocol message
+    assert server.trailing_data == (b"", False)
+    # The rest of the old request arrives mixed together with the first
+    # bytes of the new protocol; the old part is finished off as regular
+    # events...
+    server.receive_data(b"loNEW-PROTOCOL")
+    assert server.next_event() == Data(data=b"hello")
+    assert server.next_event() == EndOfMessage()
+    assert server.states == {CLIENT: SWITCHED_PROTOCOL, SERVER: SWITCHED_PROTOCOL}
+    assert server.next_event() is PAUSED
+    # ...and only the bytes after the switch point are handed over
+    assert server.trailing_data == (b"NEW-PROTOCOL", False)
+    server.receive_data(b"-CONTINUED")
+    assert server.trailing_data == (b"NEW-PROTOCOL-CONTINUED", False)
+
+
 def test_close_simple() -> None:
     # Just immediately closing a new connection without anything having
     # happened yet.

@@ -359,6 +359,24 @@ class Connection:
 
         See :ref:`switching-protocols` for discussion of why you'd want this.
         """
+        if (
+            self.our_state is SWITCHED_PROTOCOL
+            and self.their_state is not SWITCHED_PROTOCOL
+        ):
+            # We've switched protocols (e.g. we sent a 101 response), but
+            # the peer's final old-protocol message hasn't finished
+            # arriving yet -- e.g. we accepted an Upgrade while the
+            # request body was still in flight. Everything currently in
+            # the receive buffer may still belong to the old protocol
+            # (the tail of that request), so it must not be handed out as
+            # new-protocol data. Call next_event() to finish off the old
+            # message first. The new protocol's data only starts once
+            # their_state reaches SWITCHED_PROTOCOL, which happens exactly
+            # when the old-protocol parser has consumed its final byte;
+            # from then on h11 never consumes the receive buffer again, so
+            # its contents -- and anything appended later -- are all
+            # new-protocol data.
+            return (b"", self._receive_buffer_closed)
         return (bytes(self._receive_buffer), self._receive_buffer_closed)
 
     def receive_data(self, data: bytes) -> None:
