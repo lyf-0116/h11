@@ -157,3 +157,21 @@ def test_has_100_continue() -> None:
             http_version="1.0",
         )
     )
+
+
+def test_headers_backing_storage_is_frozen() -> None:
+    # Once a Headers object exists, its contents can't be mutated in place.
+    # Framing is derived from the headers exactly once when the
+    # Request/Response is processed; mutating the headers afterwards would
+    # leave the wire framing and the peer's interpretation out of sync.
+    headers = normalize_and_validate([("foo", "bar")])
+    assert isinstance(headers._full_items, tuple)
+    with pytest.raises(AttributeError):
+        headers._full_items.append((b"x", b"x", b"x"))  # type: ignore[attr-defined]
+
+
+def test_set_comma_header_returns_new_headers() -> None:
+    headers = normalize_and_validate([("foo", "bar")])
+    updated = set_comma_header(headers, b"content-length", [b"10"])
+    assert list(headers) == [(b"foo", b"bar")]
+    assert list(updated) == [(b"foo", b"bar"), (b"content-length", b"10")]

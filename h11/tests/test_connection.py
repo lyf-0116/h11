@@ -1118,3 +1118,60 @@ def test_special_exceptions_for_lost_connection_in_message_body() -> None:
     with pytest.raises(RemoteProtocolError) as excinfo:
         c.next_event()
     assert "incomplete chunked read" in str(excinfo.value)
+
+
+def test_receive_framing_frozen_after_headers_parsed() -> None:
+    # The framing is decided once, while the Request is being processed and
+    # we enter SEND_BODY. Even if someone reaches into the parsed event's
+    # private header storage afterwards, the body boundary stays the one
+    # announced on the wire.
+    c = Connection(SERVER)
+    c.receive_data(
+        b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 11\r\n\r\n"
+    )
+    request = c.next_event()
+    assert type(request) is Request
+
+    # The backing storage is a tuple, so in-place tampering is impossible.
+    with pytest.raises(AttributeError):
+        request.headers._full_items.append(  # type: ignore[attr-defined]
+            (b"Transfer-Encoding", b"transfer-encoding", b"chunked")
+        )
+
+    c.receive_data(b"hello world")
+    assert c.next_event() == Data(data=b"hello world")
+    assert type(c.next_event()) is EndOfMessage
+
+
+def test_send_framing_frozen_after_request_sent() -> None:
+    # On the sending side, the writer is selected when the Request is
+    # processed. Reaching into the event's private header storage afterwards
+    # must not switch Content-Length framing to chunked mid-message.
+    c = Connection(CLIENT)
+    request = Request(
+        method="POST",
+        target="/",
+        headers=[("Host", "example.com"), ("Content-Length", "5")],
+    )
+    assert c.send(request) == (
+        b"POST / HTTP/1.1\r\n" b"Host: example.com\r\n" b"Content-Length: 5\r\n\r\n"
+    )
+    with pytest.raises(AttributeError):
+        request.headers._full_items.append(  # type: ignore[attr-defined]
+            (b"Transfer-Encoding", b"transfer-encoding", b"chunked")
+        )
+    assert c.send(Data(b"hello")) == b"hello"
+    assert c.send(EndOfMessage()) == b""
+
+
+def test_frozen_events_reject_header_reassignment() -> None:
+    # Events are frozen: the public way to "change" headers is building a new
+    # event before handing it to the connection, never mutating one whose
+    # framing has already been derived.
+    request = Request(
+        method="POST",
+        target="/",
+        headers=[("Host", "example.com"), ("Content-Length", "5")],
+    )
+    with pytest.raises(AttributeError):
+        request.headers = []  # type: ignore[misc, assignment]

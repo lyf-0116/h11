@@ -1,0 +1,6 @@
+The backing storage of :class:`Headers` is now an immutable tuple, matching
+the frozen nature of event objects. Body framing (Content-Length, chunked, or
+HTTP/1.0 end-of-file) is derived once when the ``Request``/``Response`` is
+processed; freezing the headers prevents code from mutating them afterwards
+and desynchronizing the framing actually put on the wire from the framing
+the peer was told to expect.

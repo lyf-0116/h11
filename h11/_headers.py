@@ -101,8 +101,15 @@ class Headers(Sequence[Tuple[bytes, bytes]]):
 
     __slots__ = "_full_items"
 
-    def __init__(self, full_items: List[Tuple[bytes, bytes, bytes]]) -> None:
-        self._full_items = full_items
+    def __init__(self, full_items: Sequence[Tuple[bytes, bytes, bytes]]) -> None:
+        # Store as a tuple so the backing storage is immutable. Event objects
+        # are frozen, and the body framing (Content-Length vs. chunked vs.
+        # HTTP/1.0 EOF) is derived exactly once, when the Request/Response is
+        # processed and we enter SEND_BODY. Allowing the parsed/sent headers
+        # to be mutated afterwards would let user code change the framing
+        # inputs without changing the framing that was actually put (or
+        # expected) on the wire, desynchronizing the two peers.
+        self._full_items = tuple(full_items)
 
     def __bool__(self) -> bool:
         return bool(self._full_items)
