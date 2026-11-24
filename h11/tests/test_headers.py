@@ -129,6 +129,30 @@ def test_get_set_comma_header() -> None:
     ]
 
 
+def test_duplicate_headers_with_different_casing() -> None:
+    # Field names are case-insensitive, so two headers whose names differ
+    # only in casing are the same field. Iteration (normalized names) and
+    # case-insensitive lookup must agree on the full set of entries, while
+    # the original wire casing stays available via raw_items().
+    headers = normalize_and_validate(
+        [
+            (b"X-Evil", b"first"),
+            (b"x-evil", b"second"),
+        ],
+        _parsed=True,
+    )
+
+    assert list(headers) == [
+        (b"x-evil", b"first"),
+        (b"x-evil", b"second"),
+    ]
+    assert headers.raw_items() == [
+        (b"X-Evil", b"first"),
+        (b"x-evil", b"second"),
+    ]
+    assert get_comma_header(headers, b"x-evil") == [b"first", b"second"]
+
+
 def test_has_100_continue() -> None:
     assert has_expect_100_continue(
         Request(
