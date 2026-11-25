@@ -7,6 +7,7 @@ from .._events import (
     ConnectionClosed,
     Data,
     EndOfMessage,
+    Event,
     InformationalResponse,
     Request,
     Response,
@@ -658,7 +659,10 @@ def test_protocol_switch() -> None:
 
         # Test accept case
         p = setup()
-        p.send(SERVER, accept)
+        accept_expect: Event = accept
+        if type(accept) is Response:
+            accept_expect = Response(status_code=accept.status_code, headers=[])
+        p.send(SERVER, accept, expect=accept_expect)
         for conn in p.conns:
             assert conn.states == {CLIENT: SWITCHED_PROTOCOL, SERVER: SWITCHED_PROTOCOL}
             conn.receive_data(b"123")
@@ -693,7 +697,7 @@ def test_protocol_switch() -> None:
         sc.receive_data(b"")
         assert sc.next_event() is PAUSED
         assert sc.trailing_data == (b"", True)
-        p.send(SERVER, accept)
+        p.send(SERVER, accept, expect=accept_expect)
         assert sc.next_event() is PAUSED
 
         p = setup()
@@ -711,7 +715,7 @@ def test_protocol_switch() -> None:
                 Request(method="GET", target="/", headers=[("Host", "a")])
             )
         p = setup()
-        p.send(SERVER, accept)
+        p.send(SERVER, accept, expect=accept_expect)
         with pytest.raises(LocalProtocolError):
             p.conn[SERVER].send(Data(data=b"123"))
 
@@ -1043,13 +1047,12 @@ def test_early_detection_of_invalid_response(data: bytes) -> None:
         c.next_event()
 
 
-# This used to give different headers for HEAD and GET.
-# The correct way to handle HEAD is to put whatever headers we *would* have
-# put if it were a GET -- even though we know that for HEAD, those headers
-# will be ignored.
+# This covers the compatibility mode where HEAD response headers are chosen as
+# if the request were a GET. The default mode instead strips framing headers
+# from bodyless responses so that they cannot advertise an encoded body.
 def test_HEAD_framing_headers() -> None:
     def setup(method: bytes, http_version: bytes) -> Connection:
-        c = Connection(SERVER)
+        c = Connection(SERVER, strip_bodyless_response_headers=False)
         c.receive_data(
             method + b" / HTTP/" + http_version + b"\r\n" + b"Host: example.com\r\n\r\n"
         )
@@ -1087,6 +1090,76 @@ def test_HEAD_framing_headers() -> None:
             == b"HTTP/1.1 200 \r\n"
             b"Transfer-Encoding: chunked\r\n\r\n"
         )
+
+
+@pytest.mark.parametrize(
+    "method,status_code",
+    [
+        (b"HEAD", 200),
+        (b"GET", 204),
+        (b"GET", 304),
+        (b"CONNECT", 200),
+    ],
+)
+def test_bodyless_response_framing_headers_are_stripped(
+    method: bytes, status_code: int
+) -> None:
+    c = Connection(SERVER)
+    target = b"example.com:443" if method == b"CONNECT" else b"/"
+    c.receive_data(
+        method + b" " + target + b" HTTP/1.1\r\n" + b"Host: example.com\r\n\r\n"
+    )
+    assert type(c.next_event()) is Request
+    assert type(c.next_event()) is EndOfMessage
+
+    data = c.send(
+        Response(
+            status_code=status_code,
+            headers=[
+                ("Content-Length", "10"),
+                ("Transfer-Encoding", "chunked"),
+                ("Trailer", "X-Foo"),
+                ("X-Test", "yes"),
+            ],
+        )
+    )
+    assert data.startswith(b"HTTP/1.1 %d \r\n" % status_code)
+    assert b"X-Test: yes\r\n" in data
+    lower = data.lower()
+    assert b"content-length" not in lower
+    assert b"transfer-encoding" not in lower
+    assert b"trailer" not in lower
+
+
+def test_HEAD_response_does_not_get_automatic_chunked_header() -> None:
+    c = Connection(SERVER)
+    c.receive_data(b"HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    assert type(c.next_event()) is Request
+    assert type(c.next_event()) is EndOfMessage
+
+    assert c.send(Response(status_code=200, headers=[])) == b"HTTP/1.1 200 \r\n\r\n"
+
+
+def test_bodyless_response_framing_headers_can_be_preserved() -> None:
+    c = Connection(SERVER, strip_bodyless_response_headers=False)
+    c.receive_data(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    assert type(c.next_event()) is Request
+    assert type(c.next_event()) is EndOfMessage
+
+    data = c.send(
+        Response(
+            status_code=204,
+            headers=[
+                ("Content-Length", "10"),
+                ("Transfer-Encoding", "chunked"),
+                ("Trailer", "X-Foo"),
+            ],
+        )
+    )
+    lower = data.lower()
+    assert b"content-length: 10\r\n" in lower
+    assert b"transfer-encoding: chunked\r\n" in lower
+    assert b"trailer: x-foo\r\n" in lower
 
 
 def test_special_exceptions_for_lost_connection_in_message_body() -> None:

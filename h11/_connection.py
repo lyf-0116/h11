@@ -90,6 +90,14 @@ def _keep_alive(event: Union[Request, Response]) -> bool:
     return True
 
 
+def _is_bodyless_response(request_method: Optional[bytes], response: Response) -> bool:
+    return (
+        response.status_code in (204, 304)
+        or request_method == b"HEAD"
+        or (request_method == b"CONNECT" and 200 <= response.status_code < 300)
+    )
+
+
 def _body_framing(
     request_method: bytes, event: Union[Request, Response]
 ) -> Tuple[str, Union[Tuple[()], Tuple[int]]]:
@@ -112,11 +120,7 @@ def _body_framing(
     # Step 1: some responses always have an empty body, regardless of what the
     # headers say.
     if type(event) is Response:
-        if (
-            event.status_code in (204, 304)
-            or request_method == b"HEAD"
-            or (request_method == b"CONNECT" and 200 <= event.status_code < 300)
-        ):
+        if _is_bodyless_response(request_method, event):
             return ("content-length", (0,))
         # Section 3.3.3 also lists another case -- responses with status_code
         # < 200. For us these are InformationalResponses, not Responses, so
@@ -162,14 +166,25 @@ class Connection:
             exceeded, then :meth:`next_event` will raise
             :exc:`RemoteProtocolError`.
 
+        strip_bodyless_response_headers (bool):
+            When sending a response that is known to be bodyless (a response
+            to a HEAD request, a 204/304 response, or a successful response to
+            a CONNECT request), remove the framing headers (Content-Length,
+            Transfer-Encoding, and Trailer) so that the headers cannot
+            contradict the body being sent. Defaults to True. Set to False to
+            preserve these headers for compatibility with middleware that
+            expects them to be passed through unchanged.
+
     """
 
     def __init__(
         self,
         our_role: Type[Sentinel],
         max_incomplete_event_size: int = DEFAULT_MAX_INCOMPLETE_EVENT_SIZE,
+        strip_bodyless_response_headers: bool = True,
     ) -> None:
         self._max_incomplete_event_size = max_incomplete_event_size
+        self._strip_bodyless_response_headers = strip_bodyless_response_headers
         # State and role tracking
         if our_role not in (CLIENT, SERVER):
             raise ValueError(f"expected CLIENT or SERVER, not {our_role!r}")
@@ -643,6 +658,12 @@ class Connection:
                     need_close = True
             else:
                 headers = set_comma_header(headers, b"transfer-encoding", [b"chunked"])
+
+        if self._strip_bodyless_response_headers and _is_bodyless_response(
+            self._request_method, response
+        ):
+            for name in (b"content-length", b"transfer-encoding", b"trailer"):
+                headers = set_comma_header(headers, name, [])
 
         if not self._cstate.keep_alive or need_close:
             # Make sure Connection: close is set

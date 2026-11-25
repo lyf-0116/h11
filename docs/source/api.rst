@@ -602,6 +602,15 @@ cases:
   :attr:`Connection.their_http_version` to confirm that the client
   speaks HTTP/1.1 before you attempt to send any trailing headers.
 
+Some responses are defined to never have a body: responses to ``HEAD``
+requests, ``204`` and ``304`` responses, and successful responses to
+``CONNECT`` requests. When sending one of these responses, h11 removes any
+``Content-Length``, ``Transfer-Encoding``, and ``Trailer`` headers so that
+the headers cannot advertise a body that will not be sent. If you need to
+preserve caller-provided framing headers for compatibility with existing
+middleware, construct the :class:`Connection` with
+``strip_bodyless_response_headers=False``.
+
 
 .. _keepalive-and-pipelining:
 
